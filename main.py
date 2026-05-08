@@ -6,21 +6,19 @@
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import httpx
 import hashlib
 import hmac
+import base64
 import time
 import urllib.parse
-import os
-from typing import Optional
+from datetime import datetime, timezone
 
-app = FastAPI(title="投資組合 API", version="1.0.0")
+app = FastAPI(title="投資組合 API", version="1.1.0")
 
-# ── CORS：允許你的前端網址呼叫此 API ──────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 部署後改成你的前端網址，例如 ["https://yourapp.com"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,28 +34,18 @@ def root():
 
 # ═══════════════════════════════════════════════════════
 #  股票報價 (Yahoo Finance)
-#  GET /price?symbols=2330.TW,AAPL,BTC-USD
 # ═══════════════════════════════════════════════════════
 @app.get("/price")
-async def get_prices(symbols: str = Query(..., description="逗號分隔的代號，台股加 .TW")):
-    """
-    取得多支股票/ETF/加密貨幣即時報價
-    台股範例: 2330.TW, 0050.TW
-    美股範例: AAPL, NVDA, SPY
-    加密貨幣: BTC-USD, ETH-USD
-    """
+async def get_prices(symbols: str = Query(...)):
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     results = {}
-
     async with httpx.AsyncClient(timeout=15) as client:
         for symbol in symbol_list:
             try:
                 url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-                headers = {"User-Agent": "Mozilla/5.0"}
-                resp = await client.get(url, headers=headers)
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 resp.raise_for_status()
-                data = resp.json()
-                meta = data["chart"]["result"][0]["meta"]
+                meta = resp.json()["chart"]["result"][0]["meta"]
                 results[symbol] = {
                     "symbol": symbol,
                     "price": meta.get("regularMarketPrice", 0),
@@ -70,84 +58,84 @@ async def get_prices(symbols: str = Query(..., description="逗號分隔的代�
                 }
             except Exception as e:
                 results[symbol] = {"symbol": symbol, "price": 0, "error": str(e)}
-
     return {"prices": results, "timestamp": int(time.time())}
 
 
 # ═══════════════════════════════════════════════════════
 #  USD/TWD 匯率
-#  GET /fx
 # ═══════════════════════════════════════════════════════
 @app.get("/fx")
 async def get_fx():
-    """取得 USD/TWD 即時匯率"""
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             resp = await client.get(
                 "https://query1.finance.yahoo.com/v8/finance/chart/USDTWD=X",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            data = resp.json()
-            rate = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            rate = resp.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
             return {"USDTWD": round(rate, 4), "timestamp": int(time.time())}
         except Exception as e:
             return {"USDTWD": 32.5, "note": "使用備用匯率", "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════
-#  Binance 持倉
-#  GET /binance/balances?api_key=xxx&api_secret=yyy
+#  Binance 持倉（自動嘗試多個備用網域）
 # ═══════════════════════════════════════════════════════
+BINANCE_HOSTS = [
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api.binance.com",
+]
+
 def binance_sign(params: dict, secret: str) -> str:
     query = urllib.parse.urlencode(params)
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 @app.get("/binance/balances")
-async def binance_balances(
-    api_key: str = Query(...),
-    api_secret: str = Query(...)
-):
-    """取得 Binance 現貨帳戶餘額（非零資產）"""
+async def binance_balances(api_key: str = Query(...), api_secret: str = Query(...)):
     timestamp = int(time.time() * 1000)
     params = {"timestamp": timestamp, "omitZeroBalances": "true"}
     params["signature"] = binance_sign(params, api_secret)
 
+    last_error = "未知錯誤"
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.get(
-                "https://api.binance.com/api/v3/account",
-                headers={"X-MBX-APIKEY": api_key},
-                params=params
-            )
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.json())
-            data = resp.json()
-            balances = [
-                {
-                    "asset": b["asset"],
-                    "free": float(b["free"]),
-                    "locked": float(b["locked"]),
-                    "total": float(b["free"]) + float(b["locked"])
-                }
-                for b in data.get("balances", [])
-                if float(b["free"]) + float(b["locked"]) > 0.000001
-            ]
-            return {"exchange": "Binance", "balances": balances, "timestamp": int(time.time())}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        for host in BINANCE_HOSTS:
+            try:
+                resp = await client.get(
+                    f"{host}/api/v3/account",
+                    headers={"X-MBX-APIKEY": api_key},
+                    params=params
+                )
+                if resp.status_code == 451:
+                    last_error = f"{host} 地區限制(451)"
+                    continue
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=resp.status_code, detail=resp.json())
+                data = resp.json()
+                balances = [
+                    {"asset": b["asset"], "free": float(b["free"]),
+                     "locked": float(b["locked"]),
+                     "total": float(b["free"]) + float(b["locked"])}
+                    for b in data.get("balances", [])
+                    if float(b["free"]) + float(b["locked"]) > 0.000001
+                ]
+                return {"exchange": "Binance", "balances": balances, "host": host, "timestamp": int(time.time())}
+            except HTTPException:
+                raise
+            except Exception as e:
+                last_error = str(e)
+                continue
+    raise HTTPException(status_code=451, detail=f"所有 Binance 網域均受地區限制：{last_error}")
 
 
 # ═══════════════════════════════════════════════════════
-#  OKX 持倉
-#  GET /okx/balances?api_key=xxx&api_secret=yyy&passphrase=zzz
+#  OKX 持倉（修正簽名與時間戳格式）
 # ═══════════════════════════════════════════════════════
-def okx_sign(timestamp: str, method: str, path: str, body: str, secret: str) -> str:
-    msg = timestamp + method + path + body
-    return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
-
-import base64
+def okx_make_sign(ts: str, method: str, req_path: str, body: str, secret: str) -> str:
+    msg = ts + method + req_path + body
+    mac = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256)
+    return base64.b64encode(mac.digest()).decode()
 
 @app.get("/okx/balances")
 async def okx_balances(
@@ -155,31 +143,27 @@ async def okx_balances(
     api_secret: str = Query(...),
     passphrase: str = Query(...)
 ):
-    """取得 OKX 資金帳戶餘額"""
-    ts = str(time.time())
-    path = "/api/v5/account/balance"
-    method = "GET"
-    body = ""
-    sig_bytes = okx_sign(ts, method, path, body, api_secret)
-    sig = base64.b64encode(sig_bytes).decode()
+    now = datetime.now(timezone.utc)
+    ts = now.strftime('%Y-%m-%dT%H:%M:%S.') + f"{now.microsecond // 1000:03d}Z"
+    req_path = "/api/v5/account/balance"
+    sig = okx_make_sign(ts, "GET", req_path, "", api_secret)
 
     headers = {
         "OK-ACCESS-KEY": api_key,
         "OK-ACCESS-SIGN": sig,
         "OK-ACCESS-TIMESTAMP": ts,
         "OK-ACCESS-PASSPHRASE": passphrase,
-        "x-simulated-trading": "0"
+        "Content-Type": "application/json",
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
-            resp = await client.get("https://www.okx.com" + path, headers=headers)
+            resp = await client.get("https://www.okx.com" + req_path, headers=headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             data = resp.json()
             if data.get("code") != "0":
-                raise HTTPException(status_code=400, detail=data.get("msg", "OKX API 錯誤"))
-
+                raise HTTPException(status_code=400, detail=f"OKX 錯誤 {data.get('code')}: {data.get('msg')}")
             balances = []
             for detail in data["data"][0].get("details", []):
                 total = float(detail.get("cashBal", 0))
@@ -197,23 +181,19 @@ async def okx_balances(
 
 
 # ═══════════════════════════════════════════════════════
-#  加密貨幣 USD 報價（CoinGecko 免費 API）
-#  GET /crypto/prices?coins=bitcoin,ethereum,solana
+#  加密貨幣報價（CoinGecko）
 # ═══════════════════════════════════════════════════════
 COINGECKO_IDS = {
-    "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-    "SOL": "solana", "XRP": "ripple", "ADA": "cardano",
-    "DOGE": "dogecoin", "AVAX": "avalanche-2", "DOT": "polkadot",
-    "MATIC": "matic-network", "USDT": "tether", "USDC": "usd-coin",
-    "LTC": "litecoin", "LINK": "chainlink", "UNI": "uniswap",
+    "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana",
+    "XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","AVAX":"avalanche-2",
+    "DOT":"polkadot","MATIC":"matic-network","USDT":"tether","USDC":"usd-coin",
+    "LTC":"litecoin","LINK":"chainlink","UNI":"uniswap",
 }
 
 @app.get("/crypto/prices")
-async def crypto_prices(symbols: str = Query(..., description="逗號分隔的幣種代號，例如 BTC,ETH,SOL")):
-    """取得加密貨幣 USD 報價（CoinGecko）"""
+async def crypto_prices(symbols: str = Query(...)):
     sym_list = [s.strip().upper() for s in symbols.split(",")]
     ids = [COINGECKO_IDS.get(s, s.lower()) for s in sym_list]
-
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             resp = await client.get(
