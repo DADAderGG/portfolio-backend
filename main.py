@@ -1,20 +1,25 @@
 """
-投資組合後端 API
-支援：Binance / OKX 加密貨幣持倉、Yahoo Finance 股票報價
-部署平台：Render (免費方案)
+投資組合後端 API v2
+- 股票/加密貨幣報價
+- 持倉資料儲存（存在伺服器 JSON 檔）
+- 匯出 JSON
 """
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import httpx
 import hashlib
 import hmac
 import base64
 import time
+import json
+import os
 import urllib.parse
 from datetime import datetime, timezone
+from typing import Any
 
-app = FastAPI(title="投資組合 API", version="1.1.0")
+app = FastAPI(title="投資組合 API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,12 +29,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── 資料儲存路徑 ──────────────────────────────────────────
+DATA_FILE = "/tmp/portfolio_data.json"
+
+DEFAULT_DATA = {
+    "stocks": [],
+    "us": [],
+    "crypto": [],
+    "cash": [],
+    "updated_at": ""
+}
+
+def load_data() -> dict:
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return DEFAULT_DATA.copy()
+
+def save_data(data: dict):
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 # ═══════════════════════════════════════════════════════
 #  健康檢查
 # ═══════════════════════════════════════════════════════
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "投資組合 API 運作中 🚀"}
+    return {"status": "ok", "message": "投資組合 API v2 🚀"}
+
+
+# ═══════════════════════════════════════════════════════
+#  持倉 CRUD
+# ═══════════════════════════════════════════════════════
+@app.get("/portfolio")
+def get_portfolio():
+    """取得所有持倉資料"""
+    return load_data()
+
+@app.post("/portfolio")
+def save_portfolio(data: dict):
+    """儲存全部持倉資料（整包覆蓋）"""
+    # 只保留合法欄位
+    allowed = {"stocks", "us", "crypto", "cash"}
+    cleaned = {k: v for k, v in data.items() if k in allowed}
+    existing = load_data()
+    existing.update(cleaned)
+    save_data(existing)
+    return {"status": "ok", "updated_at": existing["updated_at"]}
+
+@app.get("/portfolio/export")
+def export_portfolio():
+    """匯出 JSON 備份"""
+    data = load_data()
+    return data
 
 
 # ═══════════════════════════════════════════════════════
@@ -79,109 +136,7 @@ async def get_fx():
 
 
 # ═══════════════════════════════════════════════════════
-#  Binance 持倉（自動嘗試多個備用網域）
-# ═══════════════════════════════════════════════════════
-BINANCE_HOSTS = [
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api.binance.com",
-]
-
-def binance_sign(params: dict, secret: str) -> str:
-    query = urllib.parse.urlencode(params)
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-
-@app.get("/binance/balances")
-async def binance_balances(api_key: str = Query(...), api_secret: str = Query(...)):
-    timestamp = int(time.time() * 1000)
-    params = {"timestamp": timestamp, "omitZeroBalances": "true"}
-    params["signature"] = binance_sign(params, api_secret)
-
-    last_error = "未知錯誤"
-    async with httpx.AsyncClient(timeout=15) as client:
-        for host in BINANCE_HOSTS:
-            try:
-                resp = await client.get(
-                    f"{host}/api/v3/account",
-                    headers={"X-MBX-APIKEY": api_key},
-                    params=params
-                )
-                if resp.status_code == 451:
-                    last_error = f"{host} 地區限制(451)"
-                    continue
-                if resp.status_code != 200:
-                    raise HTTPException(status_code=resp.status_code, detail=resp.json())
-                data = resp.json()
-                balances = [
-                    {"asset": b["asset"], "free": float(b["free"]),
-                     "locked": float(b["locked"]),
-                     "total": float(b["free"]) + float(b["locked"])}
-                    for b in data.get("balances", [])
-                    if float(b["free"]) + float(b["locked"]) > 0.000001
-                ]
-                return {"exchange": "Binance", "balances": balances, "host": host, "timestamp": int(time.time())}
-            except HTTPException:
-                raise
-            except Exception as e:
-                last_error = str(e)
-                continue
-    raise HTTPException(status_code=451, detail=f"所有 Binance 網域均受地區限制：{last_error}")
-
-
-# ═══════════════════════════════════════════════════════
-#  OKX 持倉（修正簽名與時間戳格式）
-# ═══════════════════════════════════════════════════════
-def okx_make_sign(ts: str, method: str, req_path: str, body: str, secret: str) -> str:
-    msg = ts + method + req_path + body
-    mac = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
-
-@app.get("/okx/balances")
-async def okx_balances(
-    api_key: str = Query(...),
-    api_secret: str = Query(...),
-    passphrase: str = Query(...)
-):
-    now = datetime.now(timezone.utc)
-    ts = now.strftime('%Y-%m-%dT%H:%M:%S.') + f"{now.microsecond // 1000:03d}Z"
-    req_path = "/api/v5/account/balance"
-    sig = okx_make_sign(ts, "GET", req_path, "", api_secret)
-
-    headers = {
-        "OK-ACCESS-KEY": api_key,
-        "OK-ACCESS-SIGN": sig,
-        "OK-ACCESS-TIMESTAMP": ts,
-        "OK-ACCESS-PASSPHRASE": passphrase,
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.get("https://www.okx.com" + req_path, headers=headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            data = resp.json()
-            if data.get("code") != "0":
-                raise HTTPException(status_code=400, detail=f"OKX 錯誤 {data.get('code')}: {data.get('msg')}")
-            balances = []
-            for detail in data["data"][0].get("details", []):
-                total = float(detail.get("cashBal", 0))
-                if total > 0.000001:
-                    balances.append({
-                        "asset": detail["ccy"],
-                        "total": total,
-                        "available": float(detail.get("availBal", 0))
-                    })
-            return {"exchange": "OKX", "balances": balances, "timestamp": int(time.time())}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-
-# ═══════════════════════════════════════════════════════
-#  加密貨幣報價（OKX 公開 API，支援所有幣種）
+#  加密貨幣報價（OKX 公開 API）
 # ═══════════════════════════════════════════════════════
 @app.get("/crypto/prices")
 async def crypto_prices(symbols: str = Query(...)):
