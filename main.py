@@ -181,34 +181,32 @@ async def okx_balances(
 
 
 # ═══════════════════════════════════════════════════════
-#  加密貨幣報價（CoinGecko）
+#  加密貨幣報價（OKX 公開 API，支援所有幣種）
 # ═══════════════════════════════════════════════════════
-COINGECKO_IDS = {
-    "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana",
-    "XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","AVAX":"avalanche-2",
-    "DOT":"polkadot","MATIC":"matic-network","USDT":"tether","USDC":"usd-coin",
-    "LTC":"litecoin","LINK":"chainlink","UNI":"uniswap",
-}
-
 @app.get("/crypto/prices")
 async def crypto_prices(symbols: str = Query(...)):
-    sym_list = [s.strip().upper() for s in symbols.split(",")]
-    ids = [COINGECKO_IDS.get(s, s.lower()) for s in sym_list]
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    results = {}
+    stable = {"USDT", "USDC", "USD", "BUSD", "DAI"}
     async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            resp = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": ",".join(ids), "vs_currencies": "usd", "include_24hr_change": "true"}
-            )
-            data = resp.json()
-            results = {}
-            for sym, coin_id in zip(sym_list, ids):
-                if coin_id in data:
-                    results[sym] = {
-                        "symbol": sym,
-                        "price_usd": data[coin_id].get("usd", 0),
-                        "change_24h": round(data[coin_id].get("usd_24h_change", 0), 2)
-                    }
-            return {"prices": results, "timestamp": int(time.time())}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        for sym in sym_list:
+            if sym in stable:
+                results[sym] = {"symbol": sym, "price_usd": 1.0, "change_24h": 0.0}
+                continue
+            try:
+                resp = await client.get(
+                    "https://www.okx.com/api/v5/market/ticker",
+                    params={"instId": f"{sym}-USDT"}
+                )
+                data = resp.json()
+                if data.get("code") == "0" and data.get("data"):
+                    ticker = data["data"][0]
+                    last = float(ticker.get("last", 0))
+                    open24 = float(ticker.get("open24h", last) or last)
+                    change = round((last - open24) / open24 * 100, 2) if open24 else 0
+                    results[sym] = {"symbol": sym, "price_usd": last, "change_24h": change}
+                else:
+                    results[sym] = {"symbol": sym, "price_usd": 0, "change_24h": 0, "error": "找不到幣種"}
+            except Exception as e:
+                results[sym] = {"symbol": sym, "price_usd": 0, "change_24h": 0, "error": str(e)}
+    return {"prices": results, "timestamp": int(time.time())}
